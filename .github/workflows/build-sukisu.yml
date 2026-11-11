@@ -6,16 +6,18 @@ name: Build renoir kernel (SukiSU Ultra + SUSFS + KPM)
 # Diuji lokal (clang 18): port diterapkan dan driver + file kernel yang diubah
 # terkompilasi. BELUM diuji: boot di HP, dan workflow ini di GitHub Actions.
 #
-# uname_r WAJIB sama persis dengan `uname -r` HP yang sedang memakai ROM, karena
-# modul vendor_boot (touch, baterai, display) ditolak jika release string beda.
-# Setelah ROM di-update, jalankan `uname -r` lagi dan isi ulang.
+# Release string: kernel 5.4 dengan CONFIG_MODVERSIONS (aktif di config ini) tidak
+# membandingkan release string saat memuat modul (kernel/module.c same_magic), jadi
+# tidak perlu cocok persis dengan ROM. Yang dicocokkan: flag vermagic dan CRC simbol,
+# yang sama karena sumber dan config sama. Karena itu tidak ada input wajib.
 
 on:
   workflow_dispatch:
     inputs:
       uname_r:
-        description: "Output `uname -r` dari HP, contoh 5.4.302-qgki-g1a2b3c4d5e6f"
-        required: true
+        description: "Opsional, biarkan kosong. Hanya untuk memaksa release string tertentu"
+        required: false
+        default: ""
       kernel_ref:
         description: "Cabang/commit kernel Failedmush1"
         default: "Resuki"
@@ -235,6 +237,12 @@ jobs:
       - name: Derive release suffix
         run: |
           U="${{ inputs.uname_r }}"
+          if [ -z "$U" ]; then
+            V=$(sed -n 's/^VERSION = //p' kernel/Makefile).$(sed -n 's/^PATCHLEVEL = //p' kernel/Makefile).$(sed -n 's/^SUBLEVEL = //p' kernel/Makefile)
+            U="$V-qgki-g$(git -C kernel rev-parse HEAD | cut -c1-12)"
+            echo "release string otomatis: $U"
+          fi
+          echo "UNAME_R=$U" >> "$GITHUB_ENV"
           case "$U" in *-qgki*) ;; *) echo "uname_r harus mengandung -qgki"; exit 1;; esac
           echo "LV=${U#*-qgki}" >> "$GITHUB_ENV"
 
@@ -263,7 +271,7 @@ jobs:
             LOCALVERSION="$LV" Image
           REL="$(cat out/include/config/kernel.release)"
           echo "kernel release: $REL"
-          [ "$REL" = "${{ inputs.uname_r }}" ] || { echo "release mismatch: $REL vs ${{ inputs.uname_r }}"; exit 1; }
+          [ "$REL" = "$UNAME_R" ] || { echo "release mismatch: $REL vs $UNAME_R"; exit 1; }
 
       - name: Package AnyKernel3 zip
         run: |
