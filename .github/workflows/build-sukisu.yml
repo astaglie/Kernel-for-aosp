@@ -1,0 +1,282 @@
+name: Build renoir kernel (SukiSU Ultra + SUSFS + KPM)
+
+# Repo kecil ini hanya berisi file ini (skrip port dan config AnyKernel3 sudah tertanam). Kernel (Failedmush1, cabang Resuki)
+# dan SukiSU-Ultra (cabang builtin) diambil TERBARU setiap kali dijalankan.
+#
+# Diuji lokal (clang 18): port diterapkan dan driver + file kernel yang diubah
+# terkompilasi. BELUM diuji: boot di HP, dan workflow ini di GitHub Actions.
+#
+# uname_r WAJIB sama persis dengan `uname -r` HP yang sedang memakai ROM, karena
+# modul vendor_boot (touch, baterai, display) ditolak jika release string beda.
+# Setelah ROM di-update, jalankan `uname -r` lagi dan isi ulang.
+
+on:
+  workflow_dispatch:
+    inputs:
+      uname_r:
+        description: "Output `uname -r` dari HP, contoh 5.4.302-qgki-g1a2b3c4d5e6f"
+        required: true
+      kernel_ref:
+        description: "Cabang/commit kernel Failedmush1"
+        default: "Resuki"
+      sukisu_ref:
+        description: "Cabang/commit SukiSU-Ultra (builtin = terbaru)"
+        default: "builtin"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write helper files (port script + AnyKernel3 config)
+        run: |
+          mkdir -p tools
+          cat > tools/apply_sukisu_port.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """Port the Failedmush1 renoir kernel (Resuki branch, ReSukiSU/BakaSU driver)
+          to the SukiSU-Ultra `builtin` driver.
+
+          Usage: python3 -I apply_port.py <kernel_tree> <sukisu_builtin_checkout> [sukisu_main_commit_count]
+
+          Every edit asserts that its anchor text exists exactly as expected, so a
+          change upstream makes this fail loudly instead of silently half-applying.
+          """
+          import pathlib
+          import shutil
+          import sys
+
+
+          def sub(path: pathlib.Path, old: str, new: str, count: int = 1) -> None:
+              text = path.read_text()
+              found = text.count(old)
+              if found != count:
+                  sys.exit(f"[FAIL] {path}: expected {count} x {old!r}, found {found}")
+              path.write_text(text.replace(old, new))
+              print(f"[ok] {path}: {old.strip()[:60]!r}")
+
+
+          def main() -> None:
+              tree = pathlib.Path(sys.argv[1]).resolve()
+              suki = pathlib.Path(sys.argv[2]).resolve()
+
+              # 1. swap the driver sources (drivers/kernelsu -> ../KernelSU/kernel stays)
+              dst = tree / "KernelSU"
+              if dst.exists():
+                  shutil.rmtree(dst)
+              shutil.copytree(suki, dst, ignore=shutil.ignore_patterns(".git"))
+              print(f"[ok] KernelSU/ replaced with {suki.name}")
+
+              # 1b. linux/static_call.h does not exist on 5.4 and nothing in the driver uses it.
+              sub(dst / "kernel/kernel_includes.h",
+                  "#include <linux/static_call.h>\n",
+                  "#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n"
+                  "#include <linux/static_call.h>\n"
+                  "#endif\n")
+
+              # 1c. struct clocksource::vdso_clock_mode is 5.10+. On 5.4 arm64 the same
+              #     field lives in clocksource::archdata.clock_mode.
+              sub(dst / "kernel/extension/cpu_spoof.c",
+                  "                        (*curr_cs_ptr)->vdso_clock_mode =\n"
+                  "                            VDSO_CLOCKMODE_ARCHTIMER;\n",
+                  "#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n"
+                  "                        (*curr_cs_ptr)->vdso_clock_mode =\n"
+                  "                            VDSO_CLOCKMODE_ARCHTIMER;\n"
+                  "#else\n"
+                  "                        (*curr_cs_ptr)->archdata.clock_mode =\n"
+                  "                            VDSO_CLOCKMODE_ARCHTIMER;\n"
+                  "#endif\n")
+
+              # 1d. Version pin. KSU_VERSION is derived from a GitHub API commit count and
+              #     falls back to 13000 if that lookup fails (no network, rate limit, or no
+              #     .git). The SukiSU manager rejects any kernel below 32513
+              #     (Natives.kt MINIMAL_SUPPORTED_KERNEL), so the fallback must not be
+              #     below it. 41168 = 40000 + 3983 (upstream main commits) - 2815.
+              #     The workflow passes the current commit count of SukiSU `main` as argv[3]
+              #     so the pin follows upstream; without it we use the last known count.
+              mk = dst / "kernel/Makefile"
+              mk_text = mk.read_text()
+              import re
+              base = re.search(r"^VERSION_BASE\s*:=\s*(\d+)", mk_text, re.M)
+              offset = re.search(r"^VERSION_OFFSET\s*:=\s*(\d+)", mk_text, re.M)
+              if not base or not offset:
+                  sys.exit("[FAIL] kernel/Makefile: VERSION_BASE / VERSION_OFFSET not found")
+              commits = int(sys.argv[3]) if len(sys.argv) > 3 else 3983
+              pinned = int(base.group(1)) + commits - int(offset.group(1))
+              if pinned < 32513:
+                  sys.exit(f"[FAIL] computed KSU_VERSION {pinned} is below the manager minimum 32513")
+              sub(mk,
+                  "$(shell expr $(VERSION_BASE) + $(LOCAL_COUNT) - $(VERSION_OFFSET)),13000)",
+                  f"$(shell expr $(VERSION_BASE) + $(LOCAL_COUNT) - $(VERSION_OFFSET)),{pinned})")
+              print(f"[ok] KSU_VERSION fallback pinned to {pinned} (upstream main commits: {commits})")
+
+              # 2. su_compat: SukiSU `builtin` exports a plain bool, not a static key.
+              for rel in ("fs/exec.c", "fs/stat.c", "fs/open.c"):
+                  p = tree / rel
+                  sub(p, "extern struct static_key_true ksu_su_compat_enabled;",
+                      "extern bool ksu_su_compat_enabled;")
+                  sub(p, "if (static_branch_likely(&ksu_su_compat_enabled)) {",
+                      "if (likely(ksu_su_compat_enabled)) {")
+
+              # 3. sys_read hook takes (fd, &buf, &count) in SukiSU builtin.
+              p = tree / "fs/read_write.c"
+              sub(p, "extern __attribute__((cold)) int ksu_handle_sys_read(unsigned int fd);",
+                  "extern __attribute__((cold)) int ksu_handle_sys_read(unsigned int fd, "
+                  "char __user **buf_ptr, size_t *count_ptr);")
+              sub(p, "ksu_handle_sys_read(fd);", "ksu_handle_sys_read(fd, &buf, &count);")
+
+              # 4. SUSFS v2.3.0 predates the priority-uid-filter commands that SukiSU
+              #    builtin references. Provide inert stand-ins so the driver links.
+              p = tree / "include/linux/susfs_def.h"
+              sub(p, "#define CMD_SUSFS_ADD_SUS_MAP 0x60020",
+                  "#define CMD_SUSFS_ADD_SUS_MAP 0x60020\n"
+                  "#define CMD_SUSFS_SET_PRIORITY_UID_FILTER 0x60030 /* stub: not in SUSFS v2.3.0 */")
+              p = tree / "include/linux/susfs.h"
+              sub(p, "void susfs_set_avc_log_spoofing(void __user **user_info);",
+                  "void susfs_set_avc_log_spoofing(void __user **user_info);\n"
+                  "/* Stubs: SukiSU builtin calls these, SUSFS v2.3.0 does not provide them. */\n"
+                  "static inline void susfs_parse_priority_app_strings(void) {}\n"
+                  "static inline void susfs_set_priority_uid_filter(void __user **user_info) {}")
+
+              # 4b. SukiSU builtin reports every SELinux type / avtab rule it adds to SUSFS
+              #     through these two functions (selinux/sepolicy.c). SUSFS v2.3.0 in this
+              #     tree has no such API. Its AVC log spoofing (security/selinux/avc.c) only
+              #     reads susfs_ksu_sid / susfs_priv_app_sid, which the SukiSU driver
+              #     defines itself, so nothing here would consume the data: accept and ignore.
+              p = tree / "fs/susfs.c"
+              text = p.read_text()
+              marker = "susfs_add_sus_avd_allowed_by_type"
+              if marker in text:
+                  sys.exit(f"[FAIL] {p}: {marker} already present")
+              p.write_text(text.rstrip("\n") + "\n\n"
+                  "/* SukiSU builtin hooks. No consumer in SUSFS v2.3.0, see tools/apply_sukisu_port.py */\n"
+                  "int susfs_add_sus_type(const char *secctx, u32 type_value)\n"
+                  "{\n\treturn 0;\n}\n\n"
+                  "int susfs_add_sus_avd_allowed_by_type(u32 s_type, u32 t_type, u16 type, u32 orig_avd_allowed)\n"
+                  "{\n\treturn 0;\n}\n")
+              print(f"[ok] {p}: appended susfs_add_sus_type / susfs_add_sus_avd_allowed_by_type stubs")
+
+              # 5. enable KPM in the renoir defconfig
+              p = tree / "arch/arm64/configs/vendor/lahaina-qgki_defconfig"
+              sub(p, "CONFIG_KSU=y\n", "CONFIG_KSU=y\nCONFIG_KPM=y\n")
+
+              print("[done] port applied")
+
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          cat > tools/anykernel.sh <<'AKEOF'
+          # AnyKernel3 config for Xiaomi Mi 11 Lite 5G (renoir). Replaces only the kernel
+          # Image in the boot partition; the ramdisk and vendor_boot are left untouched.
+          # Written from the AnyKernel3 template and NOT tested on a device.
+
+          properties() { '
+          kernel.string=Renoir kernel with SukiSU Ultra + SUSFS + KPM
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=renoir
+          device.name2=
+          device.name3=
+          device.name4=
+          device.name5=
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }
+
+          block=boot;
+          is_slot_device=auto;
+          ramdisk_compression=auto;
+          patch_vbmeta_flag=auto;
+          no_block_display=1;
+
+          . tools/ak3-core.sh;
+
+          # This does NOT back up the stock boot image. Save your own boot.img first so you
+          # can restore it with `fastboot flash boot boot.img` if the phone does not boot.
+          dump_boot;
+          write_boot;
+          AKEOF
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm gcc-aarch64-linux-gnu flex bison bc \
+            libssl-dev libelf-dev cpio lz4 dwarves zip
+
+      - name: Fetch latest kernel
+        uses: actions/checkout@v4
+        with:
+          repository: Failedmush1/android_kernel_xiaomi_sm8350
+          ref: ${{ inputs.kernel_ref }}
+          path: kernel
+          fetch-depth: 1
+
+      - name: Fetch latest SukiSU-Ultra and its commit count
+        run: |
+          git clone https://github.com/SukiSU-Ultra/SukiSU-Ultra "$RUNNER_TEMP/sukisu"
+          git -C "$RUNNER_TEMP/sukisu" checkout "${{ inputs.sukisu_ref }}"
+          echo "SUKISU_COMMIT=$(git -C "$RUNNER_TEMP/sukisu" rev-parse HEAD)" >> "$GITHUB_ENV"
+          git clone --bare --filter=tree:0 https://github.com/SukiSU-Ultra/SukiSU-Ultra "$RUNNER_TEMP/suki-bare"
+          N="$(git -C "$RUNNER_TEMP/suki-bare" rev-list --count main)"
+          [ "$N" -gt 3000 ] || { echo "bad commit count: $N"; exit 1; }
+          echo "SUKISU_MAIN_COMMITS=$N" >> "$GITHUB_ENV"
+
+      - name: Apply SukiSU port
+        run: |
+          echo "SukiSU builtin $SUKISU_COMMIT, main commits $SUKISU_MAIN_COMMITS"
+          python3 -I tools/apply_sukisu_port.py kernel "$RUNNER_TEMP/sukisu" "$SUKISU_MAIN_COMMITS"
+
+      - name: Derive release suffix
+        run: |
+          U="${{ inputs.uname_r }}"
+          case "$U" in *-qgki*) ;; *) echo "uname_r harus mengandung -qgki"; exit 1;; esac
+          echo "LV=${U#*-qgki}" >> "$GITHUB_ENV"
+
+      - name: Configure (same fragments the ROM build uses)
+        working-directory: kernel
+        run: |
+          MK="make O=out ARCH=arm64 CC=clang HOSTCC=gcc HOSTCXX=g++ LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip READELF=llvm-readelf CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu-"
+          $MK vendor/lahaina-qgki_defconfig
+          CF=arch/arm64/configs/vendor
+          KCONFIG_CONFIG=out/.config scripts/kconfig/merge_config.sh -m -O out out/.config \
+            $CF/debugfs.config $CF/xiaomi_QGKI.config $CF/renoir_QGKI.config
+          # LOCALVERSION_AUTO=y selalu menambah git hash; matikan agar release string
+          # persis CONFIG_LOCALVERSION ("-qgki") + suffix dari input.
+          scripts/config --file out/.config --disable LOCALVERSION_AUTO
+          $MK olddefconfig
+          grep -E '^CONFIG_(KSU|KPM|KSU_SUSFS)=' out/.config
+          grep -q '^CONFIG_KPM=y' out/.config || { echo "KPM tidak aktif"; exit 1; }
+
+      - name: Build Image
+        working-directory: kernel
+        run: |
+          make -j"$(nproc)" O=out ARCH=arm64 CC=clang HOSTCC=gcc HOSTCXX=g++ LD=ld.lld \
+            AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip READELF=llvm-readelf \
+            CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
+            LOCALVERSION="$LV" Image
+          REL="$(cat out/include/config/kernel.release)"
+          echo "kernel release: $REL"
+          [ "$REL" = "${{ inputs.uname_r }}" ] || { echo "release mismatch: $REL vs ${{ inputs.uname_r }}"; exit 1; }
+
+      - name: Package AnyKernel3 zip
+        run: |
+          git clone --depth 1 https://github.com/osm0sis/AnyKernel3 "$RUNNER_TEMP/ak3"
+          cp tools/anykernel.sh "$RUNNER_TEMP/ak3/anykernel.sh"
+          cp kernel/out/arch/arm64/boot/Image "$RUNNER_TEMP/ak3/Image"
+          cd "$RUNNER_TEMP/ak3"
+          rm -rf .git .github README.md
+          zip -r9 "$GITHUB_WORKSPACE/renoir-sukisu-ultra-$(date +%Y%m%d).zip" . -x '*.git*'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: renoir-sukisu-ultra
+          path: |
+            renoir-sukisu-ultra-*.zip
+            kernel/out/include/config/kernel.release
