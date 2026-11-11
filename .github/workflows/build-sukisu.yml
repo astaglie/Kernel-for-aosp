@@ -4,7 +4,7 @@ name: Build renoir kernel (SukiSU Ultra + SUSFS + KPM)
 # dan SukiSU-Ultra (cabang builtin) diambil TERBARU setiap kali dijalankan.
 #
 # Diuji lokal (clang 18): port diterapkan dan driver + file kernel yang diubah
-# terkompilasi. BELUM diuji: boot di HP, dan workflow ini di GitHub Actions.
+# terkompilasi. BELUM diuji: boot di HP.
 #
 # Release string: kernel 5.4 dengan CONFIG_MODVERSIONS (aktif di config ini) tidak
 # membandingkan release string saat memuat modul (kernel/module.c same_magic), jadi
@@ -172,7 +172,8 @@ jobs:
           cat > tools/anykernel.sh <<'AKEOF'
           # AnyKernel3 config for Xiaomi Mi 11 Lite 5G (renoir). Replaces only the kernel
           # Image in the boot partition; the ramdisk and vendor_boot are left untouched.
-          # Written from the AnyKernel3 template and NOT tested on a device.
+          # Variable names follow the current osm0sis/AnyKernel3 template (upper case).
+          # Does NOT back up the stock boot image: save your own boot.img first.
 
           properties() { '
           kernel.string=Renoir kernel with SukiSU Ultra + SUSFS + KPM
@@ -191,16 +192,18 @@ jobs:
           supported.vendorpatchlevels=
           '; }
 
-          block=boot;
-          is_slot_device=auto;
-          ramdisk_compression=auto;
-          patch_vbmeta_flag=auto;
-          no_block_display=1;
+          boot_attributes() {
+          set_perm_recursive 0 0 755 644 $RAMDISK/*;
+          set_perm_recursive 0 0 750 750 $RAMDISK/init* $RAMDISK/sbin;
+          }
+
+          BLOCK=boot;
+          IS_SLOT_DEVICE=auto;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
 
           . tools/ak3-core.sh;
 
-          # This does NOT back up the stock boot image. Save your own boot.img first so you
-          # can restore it with `fastboot flash boot boot.img` if the phone does not boot.
           dump_boot;
           write_boot;
           AKEOF
