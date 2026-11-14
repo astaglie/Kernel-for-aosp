@@ -1,10 +1,17 @@
 name: Build renoir kernel (SukiSU Ultra + SUSFS + KPM)
 
-# Repo kecil ini hanya berisi file ini (skrip port dan config AnyKernel3 sudah tertanam). Kernel (Failedmush1, cabang Resuki)
-# dan SukiSU-Ultra (cabang builtin) diambil TERBARU setiap kali dijalankan.
+# Repo kecil ini hanya berisi file ini (skrip port, patch hook dan config AnyKernel3 sudah
+# tertanam). Kernel (Failedmush1, cabang KSUNEXT = kernel EvoX A17) dan SukiSU-Ultra
+# (cabang builtin-new) diambil TERBARU setiap kali dijalankan.
 #
-# Diuji lokal (clang 18): port diterapkan dan driver + file kernel yang diubah
-# terkompilasi. BELUM diuji: boot di HP.
+# Diuji lokal (clang 18) pada cabang KSUNEXT: port + patch hook diterapkan, config
+# (KPM, SUSFS inline hook) benar, dan driver serta file kernel yang diubah terkompilasi.
+# Link penuh diuji pada pohon yang hampir identik (Resuki + file KSUNEXT) dan lolos.
+# BELUM diuji: boot di HP, KPM saat runtime, dan workflow ini di GitHub Actions.
+#
+# builtin-new membawa fitur avc_spoof dan selinux_hide yang diminta manager terbaru
+# (cabang builtin lama tidak punya, sehingga muncul "Kernel does not support this feature").
+# KPM butuh Image dipatch KernelPatch (langkah "Patch Image with KernelPatch").
 #
 # Release string: kernel 5.4 dengan CONFIG_MODVERSIONS (aktif di config ini) tidak
 # membandingkan release string saat memuat modul (kernel/module.c same_magic), jadi
@@ -19,11 +26,11 @@ on:
         required: false
         default: ""
       kernel_ref:
-        description: "Cabang/commit kernel Failedmush1"
-        default: "Resuki"
+        description: "Cabang/commit kernel Failedmush1 (KSUNEXT = EvoX, Resuki = Lineage)"
+        default: "KSUNEXT"
       sukisu_ref:
-        description: "Cabang/commit SukiSU-Ultra (builtin = terbaru)"
-        default: "builtin"
+        description: "Cabang/commit SukiSU-Ultra (builtin-new = terbaru untuk kernel lama)"
+        default: "builtin-new"
 
 jobs:
   build:
@@ -32,21 +39,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Write helper files (port script + AnyKernel3 config)
+      - name: Write helper files (port script + hook patch + AnyKernel3 config)
         run: |
           mkdir -p tools
           cat > tools/apply_sukisu_port.py <<'PYEOF'
           #!/usr/bin/env python3
-          """Port the Failedmush1 renoir kernel (Resuki branch, ReSukiSU/BakaSU driver)
-          to the SukiSU-Ultra `builtin` driver.
+          """Port the Failedmush1 renoir kernel (KSUNEXT or Resuki branch) to the
+          SukiSU-Ultra `builtin-new` driver.
 
-          Usage: python3 -I apply_port.py <kernel_tree> <sukisu_builtin_checkout> [sukisu_main_commit_count]
+          Usage: python3 -I apply_sukisu_port.py <kernel_tree> <sukisu_checkout> <inline_hooks.patch>
 
-          Every edit asserts that its anchor text exists exactly as expected, so a
-          change upstream makes this fail loudly instead of silently half-applying.
+          Every edit asserts that its anchor exists exactly as expected, so a change
+          upstream makes this fail loudly instead of silently half-applying.
           """
+          import os
           import pathlib
           import shutil
+          import subprocess
           import sys
 
 
@@ -62,106 +71,65 @@ jobs:
           def main() -> None:
               tree = pathlib.Path(sys.argv[1]).resolve()
               suki = pathlib.Path(sys.argv[2]).resolve()
+              hooks = pathlib.Path(sys.argv[3]).resolve()
 
-              # 1. swap the driver sources (drivers/kernelsu -> ../KernelSU/kernel stays)
+              # 1. Driver. Whatever was in drivers/kernelsu (KernelSU-Next on KSUNEXT, a
+              #    symlink to ../KernelSU/kernel on Resuki) is replaced by SukiSU, using the
+              #    layout drivers/kernelsu -> ../KernelSU/kernel that SukiSU's setup.sh makes.
+              link = tree / "drivers/kernelsu"
+              if link.is_symlink() or link.is_file():
+                  link.unlink()
+              elif link.exists():
+                  shutil.rmtree(link)
               dst = tree / "KernelSU"
               if dst.exists():
                   shutil.rmtree(dst)
               shutil.copytree(suki, dst, ignore=shutil.ignore_patterns(".git"))
-              print(f"[ok] KernelSU/ replaced with {suki.name}")
+              os.symlink("../KernelSU/kernel", link)
+              print(f"[ok] drivers/kernelsu -> KernelSU/kernel ({suki.name})")
 
-              # 1b. linux/static_call.h does not exist on 5.4 and nothing in the driver uses it.
-              sub(dst / "kernel/kernel_includes.h",
-                  "#include <linux/static_call.h>\n",
-                  "#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n"
-                  "#include <linux/static_call.h>\n"
-                  "#endif\n")
+              # 2. In-kernel hooks. SukiSU with SUSFS uses the inline hooks of the susfs4ksu
+              #    patch (exec, open, stat, read, reboot, sys, input, selinux nnp). Resuki
+              #    already has them; KSUNEXT hooks through kprobes and does not.
+              if "ksu_handle_execveat_sucompat" in (tree / "fs/exec.c").read_text():
+                  print("[ok] inline hooks already present, skipping")
+              else:
+                  for extra in ("-l",):
+                      r = subprocess.run(["patch", "-p1", "-N", extra, "-i", str(hooks)],
+                                         cwd=tree, capture_output=True, text=True)
+                      print(r.stdout)
+                      if r.returncode != 0:
+                          sys.exit(f"[FAIL] inline hooks patch did not apply:\n{r.stdout}\n{r.stderr}")
+                  left = list(tree.rglob("*.rej")) + list(tree.rglob("*.orig"))
+                  for f in left:
+                      f.unlink()
+                  print("[ok] inline hooks applied")
 
-              # 1c. struct clocksource::vdso_clock_mode is 5.10+. On 5.4 arm64 the same
-              #     field lives in clocksource::archdata.clock_mode.
-              sub(dst / "kernel/extension/cpu_spoof.c",
-                  "                        (*curr_cs_ptr)->vdso_clock_mode =\n"
-                  "                            VDSO_CLOCKMODE_ARCHTIMER;\n",
-                  "#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n"
-                  "                        (*curr_cs_ptr)->vdso_clock_mode =\n"
-                  "                            VDSO_CLOCKMODE_ARCHTIMER;\n"
-                  "#else\n"
-                  "                        (*curr_cs_ptr)->archdata.clock_mode =\n"
-                  "                            VDSO_CLOCKMODE_ARCHTIMER;\n"
-                  "#endif\n")
-
-              # 1d. Version pin. KSU_VERSION is derived from a GitHub API commit count and
-              #     falls back to 13000 if that lookup fails (no network, rate limit, or no
-              #     .git). The SukiSU manager rejects any kernel below 32513
-              #     (Natives.kt MINIMAL_SUPPORTED_KERNEL), so the fallback must not be
-              #     below it. 41168 = 40000 + 3983 (upstream main commits) - 2815.
-              #     The workflow passes the current commit count of SukiSU `main` as argv[3]
-              #     so the pin follows upstream; without it we use the last known count.
-              mk = dst / "kernel/Makefile"
-              mk_text = mk.read_text()
-              import re
-              base = re.search(r"^VERSION_BASE\s*:=\s*(\d+)", mk_text, re.M)
-              offset = re.search(r"^VERSION_OFFSET\s*:=\s*(\d+)", mk_text, re.M)
-              if not base or not offset:
-                  sys.exit("[FAIL] kernel/Makefile: VERSION_BASE / VERSION_OFFSET not found")
-              commits = int(sys.argv[3]) if len(sys.argv) > 3 else 3983
-              pinned = int(base.group(1)) + commits - int(offset.group(1))
-              if pinned < 32513:
-                  sys.exit(f"[FAIL] computed KSU_VERSION {pinned} is below the manager minimum 32513")
-              sub(mk,
-                  "$(shell expr $(VERSION_BASE) + $(LOCAL_COUNT) - $(VERSION_OFFSET)),13000)",
-                  f"$(shell expr $(VERSION_BASE) + $(LOCAL_COUNT) - $(VERSION_OFFSET)),{pinned})")
-              print(f"[ok] KSU_VERSION fallback pinned to {pinned} (upstream main commits: {commits})")
-
-              # 2. su_compat: SukiSU `builtin` exports a plain bool, not a static key.
-              for rel in ("fs/exec.c", "fs/stat.c", "fs/open.c"):
-                  p = tree / rel
-                  sub(p, "extern struct static_key_true ksu_su_compat_enabled;",
-                      "extern bool ksu_su_compat_enabled;")
-                  sub(p, "if (static_branch_likely(&ksu_su_compat_enabled)) {",
-                      "if (likely(ksu_su_compat_enabled)) {")
-
-              # 3. sys_read hook takes (fd, &buf, &count) in SukiSU builtin.
-              p = tree / "fs/read_write.c"
-              sub(p, "extern __attribute__((cold)) int ksu_handle_sys_read(unsigned int fd);",
-                  "extern __attribute__((cold)) int ksu_handle_sys_read(unsigned int fd, "
-                  "char __user **buf_ptr, size_t *count_ptr);")
-              sub(p, "ksu_handle_sys_read(fd);", "ksu_handle_sys_read(fd, &buf, &count);")
-
-              # 4. SUSFS v2.3.0 predates the priority-uid-filter commands that SukiSU
-              #    builtin references. Provide inert stand-ins so the driver links.
-              p = tree / "include/linux/susfs_def.h"
-              sub(p, "#define CMD_SUSFS_ADD_SUS_MAP 0x60020",
-                  "#define CMD_SUSFS_ADD_SUS_MAP 0x60020\n"
-                  "#define CMD_SUSFS_SET_PRIORITY_UID_FILTER 0x60030 /* stub: not in SUSFS v2.3.0 */")
-              p = tree / "include/linux/susfs.h"
-              sub(p, "void susfs_set_avc_log_spoofing(void __user **user_info);",
-                  "void susfs_set_avc_log_spoofing(void __user **user_info);\n"
-                  "/* Stubs: SukiSU builtin calls these, SUSFS v2.3.0 does not provide them. */\n"
-                  "static inline void susfs_parse_priority_app_strings(void) {}\n"
-                  "static inline void susfs_set_priority_uid_filter(void __user **user_info) {}")
-
-              # 4b. SukiSU builtin reports every SELinux type / avtab rule it adds to SUSFS
-              #     through these two functions (selinux/sepolicy.c). SUSFS v2.3.0 in this
-              #     tree has no such API. Its AVC log spoofing (security/selinux/avc.c) only
-              #     reads susfs_ksu_sid / susfs_priv_app_sid, which the SukiSU driver
-              #     defines itself, so nothing here would consume the data: accept and ignore.
+              # 3. SukiSU reports every SELinux type / avtab rule it adds to SUSFS through
+              #    these two functions. SUSFS v2.3.0 has no such API and nothing there would
+              #    consume the data (its AVC spoofing only reads susfs_ksu_sid /
+              #    susfs_priv_app_sid, which the SukiSU driver defines): accept and ignore.
               p = tree / "fs/susfs.c"
               text = p.read_text()
-              marker = "susfs_add_sus_avd_allowed_by_type"
-              if marker in text:
-                  sys.exit(f"[FAIL] {p}: {marker} already present")
-              p.write_text(text.rstrip("\n") + "\n\n"
-                  "/* SukiSU builtin hooks. No consumer in SUSFS v2.3.0, see tools/apply_sukisu_port.py */\n"
-                  "int susfs_add_sus_type(const char *secctx, u32 type_value)\n"
-                  "{\n\treturn 0;\n}\n\n"
-                  "int susfs_add_sus_avd_allowed_by_type(u32 s_type, u32 t_type, u16 type, u32 orig_avd_allowed)\n"
-                  "{\n\treturn 0;\n}\n")
-              print(f"[ok] {p}: appended susfs_add_sus_type / susfs_add_sus_avd_allowed_by_type stubs")
+              if "susfs_add_sus_avd_allowed_by_type" in text:
+                  print("[ok] susfs.c already provides the SELinux type API, skipping stubs")
+              else:
+                  p.write_text(text.rstrip("\n") + "\n\n"
+                      "/* SukiSU hooks. No consumer in SUSFS v2.3.0, see tools/apply_sukisu_port.py */\n"
+                      "int susfs_add_sus_type(const char *secctx, u32 type_value)\n"
+                      "{\n\treturn 0;\n}\n\n"
+                      "int susfs_add_sus_avd_allowed_by_type(u32 s_type, u32 t_type, u16 type, u32 orig_avd_allowed)\n"
+                      "{\n\treturn 0;\n}\n")
+                  print(f"[ok] {p}: appended susfs_add_sus_type / susfs_add_sus_avd_allowed_by_type stubs")
 
-              # 5. enable KPM in the renoir defconfig
+              # 4. defconfig: KPM on; drop KernelSU-Next's own hook option (KSUNEXT); the
+              #    priority-uid filter calls SUSFS functions that v2.3.0 does not have.
               p = tree / "arch/arm64/configs/vendor/lahaina-qgki_defconfig"
-              sub(p, "CONFIG_KSU=y\n", "CONFIG_KSU=y\nCONFIG_KPM=y\n")
+              text = p.read_text()
+              text = text.replace("CONFIG_KSU_KPROBES_HOOK=y\n", "")
+              p.write_text(text)
+              sub(p, "CONFIG_KSU=y\n",
+                  "CONFIG_KSU=y\nCONFIG_KPM=y\n# CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER is not set\n")
 
               print("[done] port applied")
 
@@ -169,6 +137,345 @@ jobs:
           if __name__ == "__main__":
               main()
           PYEOF
+          cat > tools/ksu-inline-hooks.patch <<'PATCHEOF'
+          diff -urN a/drivers/input/input.c b/drivers/input/input.c
+          --- a/drivers/input/input.c
+          +++ b/drivers/input/input.c
+          @@ -375,10 +375,20 @@
+           	return disposition;
+           }
+           
+          +#ifdef CONFIG_KSU
+          +extern struct static_key_true ksu_is_input_hook_enabled;
+          +extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);
+          +#endif
+          +
+           static void input_handle_event(struct input_dev *dev,
+           			       unsigned int type, unsigned int code, int value)
+           {
+           	int disposition = input_get_disposition(dev, type, code, &value);
+          +#ifdef CONFIG_KSU_SUSFS
+          +	if (static_branch_unlikely(&ksu_is_input_hook_enabled))
+          +		ksu_handle_input_handle_event(&type, &code, &value);
+          +#endif
+          +
+           
+           	if (disposition != INPUT_IGNORE_EVENT && type != EV_SYN)
+           		add_input_randomness(type, code, value);
+          diff -urN a/fs/exec.c b/fs/exec.c
+          --- a/fs/exec.c
+          +++ b/fs/exec.c
+          @@ -63,6 +63,9 @@
+           #include <linux/oom.h>
+           #include <linux/compat.h>
+           #include <linux/vmalloc.h>
+          +#ifdef CONFIG_KSU_SUSFS
+          +#include <linux/susfs_def.h>
+          +#endif
+           
+           #include <linux/uaccess.h>
+           #include <asm/mmu_context.h>
+          @@ -1745,6 +1748,17 @@
+           /*
+            * sys_execve() executes a new program.
+            */
+          +#ifdef CONFIG_KSU_SUSFS
+          +extern struct static_key_true ksu_su_compat_enabled;
+          +extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
+          +extern bool __ksu_is_allow_uid_for_current(uid_t uid);
+          +extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,
+          +			void *envp, int *flags);
+          +extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr, void *argv,
+          +				void *envp, int *flags);
+          +extern int ksu_handle_post_execveat_sucompat(int *fd, struct filename **filename_ptr, void *argv,
+          +			void *envp, int *flags, int *retval);
+          +#endif
+           static int __do_execve_file(int fd, struct filename *filename,
+           			    struct user_arg_ptr argv,
+           			    struct user_arg_ptr envp,
+          @@ -1755,8 +1769,23 @@
+           	struct files_struct *displaced;
+           	int retval;
+           
+          +#ifdef CONFIG_KSU_SUSFS
+          +	bool is_su_session = false;
+          +#endif // #ifdef CONFIG_KSU_SUSFS
+          +
+           	if (IS_ERR(filename))
+           		return PTR_ERR(filename);
+          +#ifdef CONFIG_KSU_SUSFS
+          +	if (likely(susfs_is_current_proc_no_su()))
+          +		goto orig_flow;
+          +	if (static_branch_likely(&ksu_su_compat_enabled)) {
+          +		if (static_branch_unlikely(&susfs_is_sdcard_android_data_not_decrypted))
+          +			is_su_session = !ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
+          +		else
+          +			is_su_session = !ksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);
+          +	}
+          +orig_flow:
+          +#endif
+           
+           	/*
+           	 * We move the actual failure in case of RLIMIT_NPROC excess from
+          @@ -1891,6 +1920,11 @@
+           	current->fs->in_exec = 0;
+           	current->in_execve = 0;
+           
+          +#ifdef CONFIG_KSU_SUSFS
+          +	if (unlikely(is_su_session))
+          +		(void)ksu_handle_post_execveat_sucompat(&fd, &filename, &argv, &envp, &flags, &retval);
+          +#endif // #ifdef CONFIG_KSU_SUSFS
+          +
+           out_free:
+           	free_bprm(bprm);
+           	kfree(pathbuf);
+          diff -urN a/fs/open.c b/fs/open.c
+          --- a/fs/open.c
+          +++ b/fs/open.c
+          @@ -32,6 +32,9 @@
+           #include <linux/ima.h>
+           #include <linux/dnotify.h>
+           #include <linux/compat.h>
+          +#ifdef CONFIG_KSU_SUSFS
+          +#include <linux/susfs_def.h>
+          +#endif
+           
+           #include "internal.h"
+           
+          @@ -345,6 +348,12 @@
+            * We do this by temporarily clearing all FS-related capabilities and
+            * switching the fsuid/fsgid around to the real ones.
+            */
+          +#ifdef CONFIG_KSU_SUSFS
+          +extern struct static_key_true ksu_su_compat_enabled;
+          +extern bool __ksu_is_allow_uid_for_current(uid_t uid);
+          +extern int ksu_handle_faccessat(int *dfd, struct filename **filename, int *mode,
+          +			int *flags);
+          +#endif
+           long do_faccessat(int dfd, const char __user *filename, int mode)
+           {
+           	const struct cred *old_cred;
+          @@ -354,6 +363,10 @@
+           	int res;
+           	unsigned int lookup_flags = LOOKUP_FOLLOW;
+           
+          +#ifdef CONFIG_KSU_SUSFS
+          +	struct filename *fname = NULL;
+          +#endif
+          +
+           	if (mode & ~S_IRWXO)	/* where's F_OK, X_OK, W_OK, R_OK? */
+           		return -EINVAL;
+           
+          @@ -395,7 +408,23 @@
+           
+           	old_cred = override_creds(override_cred);
+           retry:
+          +#ifdef CONFIG_KSU_SUSFS
+          +	fname = getname_flags(filename, lookup_flags, NULL);
+          +
+          +	if (likely(susfs_is_current_proc_no_su()))
+          +		goto orig_flow;
+          +
+          +	if (static_branch_likely(&ksu_su_compat_enabled)) {
+          +		if (unlikely(__ksu_is_allow_uid_for_current(current_uid().val)))
+          +			ksu_handle_faccessat(&dfd, &fname, &mode, NULL);
+          +	}
+          +
+          +orig_flow:
+          +	res = filename_lookup(dfd, fname, lookup_flags, &path, NULL);
+          +	// no putname(fname) here as filename_lookup() has it done for us already;
+          +#else
+           	res = user_path_at(dfd, filename, lookup_flags, &path);
+          +#endif
+           	if (res)
+           		goto out;
+           
+          diff -urN a/fs/read_write.c b/fs/read_write.c
+          --- a/fs/read_write.c
+          +++ b/fs/read_write.c
+          @@ -592,8 +592,16 @@
+           	return ret;
+           }
+           
+          +#ifdef CONFIG_KSU
+          +extern struct static_key_true ksu_is_init_rc_hook_enabled;
+          +extern __attribute__((cold)) int ksu_handle_sys_read(unsigned int fd);
+          +#endif
+           SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
+           {
+          +#ifdef CONFIG_KSU
+          +	if (static_branch_unlikely(&ksu_is_init_rc_hook_enabled))
+          +		ksu_handle_sys_read(fd);
+          +#endif
+           	return ksys_read(fd, buf, count);
+           }
+           
+          diff -urN a/fs/stat.c b/fs/stat.c
+          --- a/fs/stat.c
+          +++ b/fs/stat.c
+          @@ -17,12 +17,21 @@
+           #include <linux/syscalls.h>
+           #include <linux/pagemap.h>
+           #include <linux/compat.h>
+          -#ifdef CONFIG_KSU_SUSFS
+          -#include <linux/susfs_def.h>
+          -#endif
+          +#include "internal.h"
+           
+           #include <linux/uaccess.h>
+           #include <asm/unistd.h>
+          +#ifdef CONFIG_KSU_SUSFS
+          +#include <linux/susfs_def.h>
+          +#include "mount.h"
+          +#endif
+          +#ifdef CONFIG_KSU_SUSFS
+          +extern struct static_key_true ksu_is_init_rc_hook_enabled;
+          +extern void ksu_handle_vfs_fstat(int fd, loff_t *kstat_size_ptr);
+          +extern struct static_key_true ksu_su_compat_enabled;
+          +extern bool __ksu_is_allow_uid_for_current(uid_t uid);
+          +extern int ksu_handle_stat(int *dfd, struct filename **filename, int *flags);
+          +#endif // #ifdef CONFIG_KSU_SUSFS
+           
+           #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+           extern bool susfs_is_inode_sus_kstat(struct inode *inode, bool *out_is_fuse);
+          @@ -196,6 +205,11 @@
+           	if (f.file) {
+           		error = vfs_getattr(&f.file->f_path, stat,
+           				    request_mask, query_flags);
+          +#ifdef CONFIG_KSU_SUSFS
+          +		if (static_branch_unlikely(&ksu_is_init_rc_hook_enabled))
+          +			ksu_handle_vfs_fstat(fd, &stat->size);
+          +#endif // #ifdef CONFIG_KSU_SUSFS
+          +
+           		fdput(f);
+           	}
+           	return error;
+          @@ -224,6 +238,10 @@
+           	struct path path;
+           	int error = -EINVAL;
+           	unsigned int lookup_flags = LOOKUP_FOLLOW | LOOKUP_AUTOMOUNT;
+          +#ifdef CONFIG_KSU_SUSFS
+          +	struct filename *fname = NULL;
+          +#endif
+          +
+           
+           	if ((flags & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT |
+           		       AT_EMPTY_PATH | KSTAT_QUERY_FLAGS)) != 0)
+          @@ -237,7 +255,23 @@
+           		lookup_flags |= LOOKUP_EMPTY;
+           
+           retry:
+          +#ifdef CONFIG_KSU_SUSFS
+          +	fname = getname_flags(filename, lookup_flags, NULL);
+          +
+          +	if (likely(susfs_is_current_proc_no_su()))
+          +		goto orig_flow;
+          +
+          +	if (static_branch_likely(&ksu_su_compat_enabled)) {
+          +		if (unlikely(__ksu_is_allow_uid_for_current(current_uid().val)))
+          +			ksu_handle_stat(&dfd, &fname, &flags);
+          +	}
+          +
+          +orig_flow:
+          +	error = filename_lookup(dfd, fname, lookup_flags, &path, NULL);
+          +	// no putname(fname) here as filename_lookup() has it done for us already;
+          +#else
+           	error = user_path_at(dfd, filename, lookup_flags, &path);
+          +#endif
+           	if (error)
+           		goto out;
+           
+          diff -urN a/kernel/reboot.c b/kernel/reboot.c
+          --- a/kernel/reboot.c
+          +++ b/kernel/reboot.c
+          @@ -310,12 +310,22 @@
+            *
+            * reboot doesn't sync: do that yourself before calling this.
+            */
+          +#ifdef CONFIG_KSU_SUSFS
+          +extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);
+          +#endif
+          +
+           SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
+           		void __user *, arg)
+           {
+           	struct pid_namespace *pid_ns = task_active_pid_ns(current);
+           	char buffer[256];
+           	int ret = 0;
+          +#ifdef CONFIG_KSU_SUSFS
+          +	if (system_state == SYSTEM_RUNNING) {
+          +		ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
+          +	}
+          +#endif
+          +
+           
+           	/* We only trust the superuser with rebooting the system. */
+           	if (!ns_capable(pid_ns->user_ns, CAP_SYS_BOOT))
+          diff -urN a/kernel/sys.c b/kernel/sys.c
+          --- a/kernel/sys.c
+          +++ b/kernel/sys.c
+          @@ -687,8 +687,18 @@
+           	return retval;
+           }
+           
+          +#ifdef CONFIG_KSU
+          +extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);
+          +#endif
+          +
+           SYSCALL_DEFINE3(setresuid, uid_t, ruid, uid_t, euid, uid_t, suid)
+           {
+          +#ifdef CONFIG_KSU_SUSFS
+          +	if (ksu_handle_setresuid(ruid, euid, suid)) {
+          +		pr_info("Something wrong with ksu_handle_setresuid()\n");
+          +	}
+          +#endif
+          +
+           	return __sys_setresuid(ruid, euid, suid);
+           }
+           
+          diff -urN a/security/selinux/hooks.c b/security/selinux/hooks.c
+          --- a/security/selinux/hooks.c
+          +++ b/security/selinux/hooks.c
+          @@ -2295,17 +2295,38 @@
+           			    const struct task_security_struct *old_tsec,
+           			    const struct task_security_struct *new_tsec)
+           {
+          +#ifdef CONFIG_KSU
+          +	static u32 ksu_sid;
+          +	char *secdata;
+          +#endif
+           	int nnp = (bprm->unsafe & LSM_UNSAFE_NO_NEW_PRIVS);
+           	int nosuid = !mnt_may_suid(bprm->file->f_path.mnt);
+           	int rc;
+           	u32 av;
+           
+          +#ifdef CONFIG_KSU
+          +	int error;
+          +	u32 seclen;
+          +#endif
+           	if (!nnp && !nosuid)
+           		return 0; /* neither NNP nor nosuid */
+           
+           	if (new_tsec->sid == old_tsec->sid)
+           		return 0; /* No change in credentials */
+           
+          +#ifdef CONFIG_KSU
+          +	if (!ksu_sid)
+          +		security_secctx_to_secid("u:r:su:s0", strlen("u:r:su:s0"), &ksu_sid);
+          +
+          +	error = security_secid_to_secctx(old_tsec->sid, &secdata, &seclen);
+          +	if (!error) {
+          +		rc = strcmp("u:r:init:s0", secdata);
+          +		security_release_secctx(secdata, seclen);
+          +		if (rc == 0 && new_tsec->sid == ksu_sid)
+          +			return 0;
+          +	}
+          +#endif
+          +
+           	/*
+           	 * If the policy enables the nnp_nosuid_transition policy capability,
+           	 * then we permit transitions under NNP or nosuid if the
+          PATCHEOF
           cat > tools/anykernel.sh <<'AKEOF'
           # AnyKernel3 config for Xiaomi Mi 11 Lite 5G (renoir). Replaces only the kernel
           # Image in the boot partition; the ramdisk and vendor_boot are left untouched.
@@ -222,20 +529,18 @@ jobs:
           path: kernel
           fetch-depth: 1
 
-      - name: Fetch latest SukiSU-Ultra and its commit count
+      - name: Fetch latest SukiSU-Ultra
         run: |
           git clone https://github.com/SukiSU-Ultra/SukiSU-Ultra "$RUNNER_TEMP/sukisu"
           git -C "$RUNNER_TEMP/sukisu" checkout "${{ inputs.sukisu_ref }}"
           echo "SUKISU_COMMIT=$(git -C "$RUNNER_TEMP/sukisu" rev-parse HEAD)" >> "$GITHUB_ENV"
-          git clone --bare --filter=tree:0 https://github.com/SukiSU-Ultra/SukiSU-Ultra "$RUNNER_TEMP/suki-bare"
-          N="$(git -C "$RUNNER_TEMP/suki-bare" rev-list --count main)"
-          [ "$N" -gt 3000 ] || { echo "bad commit count: $N"; exit 1; }
-          echo "SUKISU_MAIN_COMMITS=$N" >> "$GITHUB_ENV"
+          [ -d "$RUNNER_TEMP/sukisu/kernel/feature" ] && grep -q avc_spoof "$RUNNER_TEMP/sukisu/kernel/feature/avc_spoof.c" \
+            || { echo "cabang SukiSU ini tidak punya avc_spoof; pakai builtin-new"; exit 1; }
 
       - name: Apply SukiSU port
         run: |
-          echo "SukiSU builtin $SUKISU_COMMIT, main commits $SUKISU_MAIN_COMMITS"
-          python3 -I tools/apply_sukisu_port.py kernel "$RUNNER_TEMP/sukisu" "$SUKISU_MAIN_COMMITS"
+          echo "SukiSU ${{ inputs.sukisu_ref }} $SUKISU_COMMIT"
+          python3 -I tools/apply_sukisu_port.py kernel "$RUNNER_TEMP/sukisu" "$PWD/tools/ksu-inline-hooks.patch"
 
       - name: Derive release suffix
         run: |
@@ -261,8 +566,10 @@ jobs:
           # persis CONFIG_LOCALVERSION ("-qgki") + suffix dari input.
           scripts/config --file out/.config --disable LOCALVERSION_AUTO
           $MK olddefconfig
-          grep -E '^CONFIG_(KSU|KPM|KSU_SUSFS)=' out/.config
+          grep -E '^(# )?CONFIG_(KSU|KPM|KSU_SUSFS)(_INLINE_HOOK|_PRIORITY_UID_FILTER)?[= ]' out/.config
           grep -q '^CONFIG_KPM=y' out/.config || { echo "KPM tidak aktif"; exit 1; }
+          grep -q '^CONFIG_KSU_SUSFS_INLINE_HOOK=y' out/.config || { echo "SUSFS inline hook tidak aktif"; exit 1; }
+          grep -q '^# CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER is not set' out/.config || { echo "priority uid filter harus mati (SUSFS v2.3.0 tidak punya fungsinya)"; exit 1; }
 
       - name: Build Image
         working-directory: kernel
@@ -276,11 +583,30 @@ jobs:
           echo "kernel release: $REL"
           [ "$REL" = "$UNAME_R" ] || { echo "release mismatch: $REL vs $UNAME_R"; exit 1; }
 
+      - name: Patch Image with KernelPatch (required for KPM)
+        run: |
+          git clone --depth 1 https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch "$RUNNER_TEMP/kp"
+          KP="$RUNNER_TEMP/kp"
+          echo "KernelPatch $(git -C "$KP" rev-parse --short HEAD)"
+          # The kernel's KPM bridge and kpimg must speak the same ABI version.
+          A=$(grep -rhoE 'define SUKISU_KPM_ABI_VERSION +[0-9]+' kernel/KernelSU/kernel/extension/kpm/bridge.h | awk '{print $3}')
+          B=$(grep -rhoE 'define SUKISU_KPM_ABI_VERSION +[0-9]+' "$KP/kernel/patch/sukisu" | awk '{print $3}' | head -1)
+          echo "KPM ABI: kernel=$A kernelpatch=$B"
+          [ -n "$A" ] && [ "$A" = "$B" ] || { echo "KPM ABI mismatch"; exit 1; }
+          cmake -S "$KP/tools" -B "$KP/tools/build" > /dev/null
+          cmake --build "$KP/tools/build" -j"$(nproc)" > /dev/null
+          (cd "$KP/kernel" && TARGET_COMPILE=aarch64-linux-gnu- ANDROID=1 \
+            make kpimg -j"$(nproc)" CC="aarch64-linux-gnu-gcc -fno-stack-protector -fno-pie" > /dev/null)
+          IMG=kernel/out/arch/arm64/boot/Image
+          "$KP/tools/build/kptools" -p -i "$IMG" -k "$KP/kernel/kpimg" -s "$(openssl rand -hex 12)" -o "$RUNNER_TEMP/Image.kp" | tail -3
+          [ "$(stat -c%s "$RUNNER_TEMP/Image.kp")" -gt "$(stat -c%s "$IMG")" ] || { echo "patched Image not larger"; exit 1; }
+          strings -a "$RUNNER_TEMP/Image.kp" | grep -q 'KernelPatch Version' || { echo "kpimg not embedded"; exit 1; }
+
       - name: Package AnyKernel3 zip
         run: |
           git clone --depth 1 https://github.com/osm0sis/AnyKernel3 "$RUNNER_TEMP/ak3"
           cp tools/anykernel.sh "$RUNNER_TEMP/ak3/anykernel.sh"
-          cp kernel/out/arch/arm64/boot/Image "$RUNNER_TEMP/ak3/Image"
+          cp "$RUNNER_TEMP/Image.kp" "$RUNNER_TEMP/ak3/Image"
           cd "$RUNNER_TEMP/ak3"
           rm -rf .git .github README.md
           zip -r9 "$GITHUB_WORKSPACE/renoir-sukisu-ultra-$(date +%Y%m%d).zip" . -x '*.git*'
