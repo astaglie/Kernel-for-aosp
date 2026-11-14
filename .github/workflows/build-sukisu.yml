@@ -542,6 +542,25 @@ jobs:
           echo "SukiSU ${{ inputs.sukisu_ref }} $SUKISU_COMMIT"
           python3 -I tools/apply_sukisu_port.py kernel "$RUNNER_TEMP/sukisu" "$PWD/tools/ksu-inline-hooks.patch"
 
+      - name: Enable KPM on 5.4
+        run: |
+          python3 -I - kernel <<'PYEOF'
+          import pathlib, re, sys
+          p = pathlib.Path(sys.argv[1]) / "KernelSU/kernel/kernel_compat.h"
+          t = p.read_text()
+          if "KSU_CAN_USE_KPM" not in t:
+              print("upstream no longer has a KPM version gate, nothing to do")
+          elif re.search(r"KERNEL_VERSION\(5, 4, 0\)\n#define KSU_CAN_USE_KPM", t):
+              print("KPM gate already allows 5.4")
+          else:
+              n, c = re.subn(r"KERNEL_VERSION\(5, 10, 0\)(\n#define KSU_CAN_USE_KPM)",
+                             r"KERNEL_VERSION(5, 4, 0)\1", t)
+              if c != 1:
+                  sys.exit("KPM version gate changed upstream, update this step")
+              p.write_text(n)
+              print("KPM gate relaxed to 5.4")
+          PYEOF
+
       - name: Derive release suffix
         run: |
           U="${{ inputs.uname_r }}"
@@ -582,6 +601,11 @@ jobs:
           REL="$(cat out/include/config/kernel.release)"
           echo "kernel release: $REL"
           [ "$REL" = "$UNAME_R" ] || { echo "release mismatch: $REL vs $UNAME_R"; exit 1; }
+
+      - name: Verify KPM is compiled in
+        run: |
+          strings -a kernel/out/arch/arm64/boot/Image | grep -q 'extension/kpm' \
+            || { echo "KPM tidak ikut ter-compile"; exit 1; }
 
       - name: Patch Image with KernelPatch (required for KPM)
         run: |
